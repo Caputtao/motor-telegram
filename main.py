@@ -6,22 +6,20 @@ import asyncio
 import requests
 from bs4 import BeautifulSoup
 import os
+import datetime
 
 # ==========================================
 # 1. SUAS CHAVES DO TELEGRAM
 # ==========================================
-# Substitua pelos seus dados reais do my.telegram.org
-API_ID = 38969303         # Ex: 1234567 (Apenas números, sem aspas)
-API_HASH = '8948ebc80c092365ff2cc0560a3cde56'   # Ex: 'a1b2c3d4e5f6g7h8' (Sempre entre aspas)
+API_ID = 38969303         # Apenas números, sem aspas
+API_HASH = '8948ebc80c092365ff2cc0560a3cde56'   # Com aspas
 
 BOT_USERNAME = '@SantSearchhBot'
-
-# Puxa a chave de sessão gigante que você salvou no Environment do Render
 CHAVE_FIXA = os.environ.get('CHAVE_TELEGRAM', '')
+LIMITE_DIARIO = 25
 
 app = FastAPI()
 
-# Libera o acesso para o seu Google Sites
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], 
@@ -29,34 +27,68 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Inicia o Telegram usando a Chave Fixa (o que impede ele de deslogar)
 client = TelegramClient(StringSession(CHAVE_FIXA), API_ID, API_HASH)
+
+# ==========================================
+# FUNÇÃO: CONTAR CONSULTAS DO DIA
+# ==========================================
+async def contar_consultas_hoje():
+    # Pega a data de hoje no fuso horário do Brasil (UTC-3)
+    fuso_br = datetime.timezone(datetime.timedelta(hours=-3))
+    hoje = datetime.datetime.now(fuso_br).date()
+    
+    contador = 0
+    # Lê o histórico recente com o bot
+    async for msg in client.iter_messages(BOT_USERNAME):
+        data_msg = msg.date.astimezone(fuso_br).date()
+        
+        # Se a mensagem for de ontem para trás, para de contar
+        if data_msg < hoje:
+            break
+            
+        # Conta apenas as mensagens que nós enviamos e que começam com /cpf
+        if msg.out and msg.text and msg.text.startswith('/cpf'):
+            contador += 1
+            
+    return contador
+
+# ==========================================
+# ROTA: VERIFICAR PLACAR
+# ==========================================
+@app.get("/status")
+async def verificar_status():
+    if not client.is_connected():
+        await client.connect()
+    
+    try:
+        usadas = await contar_consultas_hoje()
+        return {"sucesso": True, "usadas": usadas, "limite": LIMITE_DIARIO}
+    except Exception as e:
+        return {"sucesso": False, "erro": str(e)}
 
 # ==========================================
 # 2. O MOTOR DE BUSCA (A ROTA PRINCIPAL)
 # ==========================================
 @app.get("/consultar/{cpf}")
 async def consultar_cpf(cpf: str):
-    # Garante que o cliente está conectado
     if not client.is_connected():
         await client.connect()
     
-    # Verifica se a sessão é válida
     if not await client.is_user_authorized():
-        return {"sucesso": False, "erro": "Sessão inválida ou não autorizada. Verifique a CHAVE_TELEGRAM no Render."}
+        return {"sucesso": False, "erro": "Sessão inválida."}
+
+    # VERIFICA O LIMITE ANTES DE PESQUISAR
+    usadas = await contar_consultas_hoje()
+    if usadas >= LIMITE_DIARIO:
+        return {"sucesso": False, "erro": f"LIMITE ATINGIDO! Você já fez {usadas} consultas hoje. Volte amanhã."}
 
     try:
-        # Passo A: Manda a mensagem para o bot
         await client.send_message(BOT_USERNAME, f'/cpf {cpf}')
-        
-        # Passo B: Aguarda 5 segundos (tempo para o bot processar)
         await asyncio.sleep(5)
         
-        # Passo C: Puxa as últimas mensagens para ler a resposta
         messages = await client.get_messages(BOT_USERNAME, limit=2)
         target_url = None
         
-        # Passo D: Varre a mensagem procurando o botão de resultado
         for msg in messages:
             if msg.reply_markup and hasattr(msg.reply_markup, 'rows'):
                 for row in msg.reply_markup.rows:
@@ -68,22 +100,19 @@ async def consultar_cpf(cpf: str):
                 break
                         
         if not target_url:
-            return {"sucesso": False, "erro": "Botão 'RESULTADO AQUI' não encontrado. O bot do Telegram pode estar lento."}
+            return {"sucesso": False, "erro": "Botão não encontrado. Bot lento."}
             
-        # Passo E: Acessa o site final que estava no botão
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        headers = {'User-Agent': 'Mozilla/5.0'}
         resposta = requests.get(target_url, headers=headers)
         
-        # Passo F: Raspa e limpa o texto do site
         soup = BeautifulSoup(resposta.text, 'html.parser')
         texto_limpo = soup.get_text(separator='\n', strip=True)
         
         return {"sucesso": True, "dados": texto_limpo}
 
     except Exception as e:
-        return {"sucesso": False, "erro": f"Erro interno no servidor: {str(e)}"}
+        return {"sucesso": False, "erro": f"Erro interno: {str(e)}"}
 
-# Conecta ao Telegram assim que o Render ligar o servidor
 @app.on_event("startup")
 async def startup_event():
     await client.connect()
